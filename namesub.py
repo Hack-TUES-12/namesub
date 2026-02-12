@@ -14,8 +14,9 @@ except ImportError:
     def tqdm(iterable, *args, **kwargs):
         return iterable
 
+
 template = ''
-inkscape_path = os.path.expanduser('~/Downloads/software/inkscape/squashfs-root/AppRun')
+inkscape_path = inkscape_path = r'C:\Program Files\Inkscape\bin\inkscape.exe'
 replace_text = 'Име Фамилия'
 subtitle_replace_text = 'описание'
 overwrite = False
@@ -168,6 +169,53 @@ def center_text_in_svg(svg_content, text_content):
     return svg_content
 
 
+def convert_text_to_paths(svg_file_path):
+    """
+    Convert all text elements in an SVG file to paths using Inkscape.
+    This ensures the SVG displays correctly even without the custom font installed.
+    """
+    try:
+        # Convert to absolute path for Inkscape
+        abs_path = os.path.abspath(svg_file_path)
+        if not os.path.exists(abs_path):
+            print(f"Warning: SVG file not found: {abs_path}", file=sys.stderr)
+            return
+        
+        # Use Inkscape's command-line interface to convert text to paths
+        # Actions: select all text elements, convert to paths, then export back
+        # --batch-process ensures no windows open (--no-gui not available in all versions)
+        creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+        
+        # Use export method which is more reliable - convert and export back to same file
+        subprocess.check_call(
+            [inkscape_path,
+             abs_path,
+             '--batch-process',
+             '--actions=select-all:text;object-to-path',
+             f'--export-filename={abs_path}',
+             '--export-type=svg'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=creation_flags
+        )
+    except subprocess.CalledProcessError as e:
+        # If conversion fails, log but don't crash - the SVG will still work if font is installed
+        # Try to get more info about the error
+        try:
+            result = subprocess.run(
+                [inkscape_path, abs_path, '--batch-process',
+                 '--actions=select-all:text;object-to-path',
+                 f'--export-filename={abs_path}', '--export-type=svg'],
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            )
+            error_msg = result.stderr[:200] if result.stderr else "Unknown error"
+            print(f"Warning: Failed to convert text to paths in {svg_file_path}: {error_msg}", file=sys.stderr)
+        except Exception:
+            print(f"Warning: Failed to convert text to paths in {svg_file_path}: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"Warning: Error converting text to paths in {svg_file_path}: {e}", file=sys.stderr)
+
+
 def generate_svg(name, subtitle, filename=None):
     if filename is None:
         filename = name
@@ -182,6 +230,8 @@ def generate_svg(name, subtitle, filename=None):
             result = center_text_in_svg(result, subtitle)
         with open(filename, 'w', encoding='utf-8') as output_file:
             output_file.write(result)
+        # Convert text to paths to ensure font independence
+        convert_text_to_paths(filename)
     return filename
 
 
@@ -197,10 +247,14 @@ def generate_file_format(name, file_extension, subtitle, filename=None):
             os.remove(format_filename)
     ensure_tree_exists(format_filename)
     subprocess.check_call(
-        [inkscape_path, svg_filename,
-         '--export-area-drawing', '--batch-process',
-         f'--export-type={file_extension}', f'--export-filename={format_filename}'],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        [inkscape_path,
+         '--batch-process',
+         '--export-area-drawing',
+         f'--export-type={file_extension}',
+         f'--export-filename={format_filename}',
+         svg_filename],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
     )
     return format_filename
 
