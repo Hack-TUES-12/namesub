@@ -191,7 +191,7 @@ def convert_text_to_paths(svg_file_path):
             [inkscape_path,
              abs_path,
              '--batch-process',
-             '--actions=select-all:text;object-to-path',
+             '--actions=select-all;object-to-path;export-do',
              f'--export-filename={abs_path}',
              '--export-type=svg'],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -203,7 +203,7 @@ def convert_text_to_paths(svg_file_path):
         try:
             result = subprocess.run(
                 [inkscape_path, abs_path, '--batch-process',
-                 '--actions=select-all:text;object-to-path',
+                 '--actions=select-all;object-to-path;export-do',
                  f'--export-filename={abs_path}', '--export-type=svg'],
                 capture_output=True, text=True, timeout=10,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
