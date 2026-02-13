@@ -168,54 +168,6 @@ def center_text_in_svg(svg_content, text_content):
     
     return svg_content
 
-
-def convert_text_to_paths(svg_file_path):
-    """
-    Convert all text elements in an SVG file to paths using Inkscape.
-    This ensures the SVG displays correctly even without the custom font installed.
-    """
-    try:
-        # Convert to absolute path for Inkscape
-        abs_path = os.path.abspath(svg_file_path)
-        if not os.path.exists(abs_path):
-            print(f"Warning: SVG file not found: {abs_path}", file=sys.stderr)
-            return
-        
-        # Use Inkscape's command-line interface to convert text to paths
-        # Actions: select all text elements, convert to paths, then export back
-        # --batch-process ensures no windows open (--no-gui not available in all versions)
-        creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-        
-        # Use export method which is more reliable - convert and export back to same file
-        subprocess.check_call(
-            [inkscape_path,
-             abs_path,
-             '--batch-process',
-             '--actions=select-all;object-to-path;export-do',
-             f'--export-filename={abs_path}',
-             '--export-type=svg'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=creation_flags
-        )
-    except subprocess.CalledProcessError as e:
-        # If conversion fails, log but don't crash - the SVG will still work if font is installed
-        # Try to get more info about the error
-        try:
-            result = subprocess.run(
-                [inkscape_path, abs_path, '--batch-process',
-                 '--actions=select-all;object-to-path;export-do',
-                 f'--export-filename={abs_path}', '--export-type=svg'],
-                capture_output=True, text=True, timeout=10,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-            )
-            error_msg = result.stderr[:200] if result.stderr else "Unknown error"
-            print(f"Warning: Failed to convert text to paths in {svg_file_path}: {error_msg}", file=sys.stderr)
-        except Exception:
-            print(f"Warning: Failed to convert text to paths in {svg_file_path}: {e}", file=sys.stderr)
-    except Exception as e:
-        print(f"Warning: Error converting text to paths in {svg_file_path}: {e}", file=sys.stderr)
-
-
 def chunked(iterable, size):
     for i in range(0, len(iterable), size):
         yield iterable[i:i + size]
@@ -237,32 +189,7 @@ def generate_svg(name, subtitle, filename=None):
         with open(filename, 'w', encoding='utf-8') as output_file:
             output_file.write(result)
         # Convert text to paths to ensure font independence
-        # convert_text_to_paths(filename)
     return filename
-
-
-# def generate_file_format(name, file_extension, subtitle, filename=None):
-#     svg_filename = generate_svg(name, subtitle, filename)
-#     format_filename = (svg_filename
-#                        .replace('.svg', f'.{file_extension}')
-#                        .replace('svg/', f'{file_extension}/'))
-#     if os.path.exists(format_filename):
-#         if not overwrite:
-#             return format_filename
-#         else:
-#             os.remove(format_filename)
-#     ensure_tree_exists(format_filename)
-#     subprocess.check_call(
-#         [inkscape_path,
-#          '--batch-process',
-#          '--export-area-drawing',
-#          f'--export-type={file_extension}',
-#          f'--export-filename={format_filename}',
-#          svg_filename],
-#         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-#         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-#     )
-#     return format_filename
 
 
 def batch_process(svg_files, export_png=False, export_pdf=False, chunk_size=20):
@@ -336,15 +263,6 @@ def batch_process(svg_files, export_png=False, export_pdf=False, chunk_size=20):
             stderr=subprocess.DEVNULL,
             creationflags=creation_flags
         )
-
-
-
-def generate_png(name, subtitle, filename=None):
-    return generate_file_format(name, 'png', subtitle, filename)
-
-
-def generate_pdf(name, subtitle, filename=None):
-    return generate_file_format(name, 'pdf', subtitle, filename)
 
 
 def main():
