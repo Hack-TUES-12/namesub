@@ -216,6 +216,12 @@ def convert_text_to_paths(svg_file_path):
         print(f"Warning: Error converting text to paths in {svg_file_path}: {e}", file=sys.stderr)
 
 
+def chunked(iterable, size):
+    for i in range(0, len(iterable), size):
+        yield iterable[i:i + size]
+
+
+
 def generate_svg(name, subtitle, filename=None):
     if filename is None:
         filename = name
@@ -231,32 +237,106 @@ def generate_svg(name, subtitle, filename=None):
         with open(filename, 'w', encoding='utf-8') as output_file:
             output_file.write(result)
         # Convert text to paths to ensure font independence
-        convert_text_to_paths(filename)
+        # convert_text_to_paths(filename)
     return filename
 
 
-def generate_file_format(name, file_extension, subtitle, filename=None):
-    svg_filename = generate_svg(name, subtitle, filename)
-    format_filename = (svg_filename
-                       .replace('.svg', f'.{file_extension}')
-                       .replace('svg/', f'{file_extension}/'))
-    if os.path.exists(format_filename):
-        if not overwrite:
-            return format_filename
-        else:
-            os.remove(format_filename)
-    ensure_tree_exists(format_filename)
-    subprocess.check_call(
-        [inkscape_path,
-         '--batch-process',
-         '--export-area-drawing',
-         f'--export-type={file_extension}',
-         f'--export-filename={format_filename}',
-         svg_filename],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-    )
-    return format_filename
+# def generate_file_format(name, file_extension, subtitle, filename=None):
+#     svg_filename = generate_svg(name, subtitle, filename)
+#     format_filename = (svg_filename
+#                        .replace('.svg', f'.{file_extension}')
+#                        .replace('svg/', f'{file_extension}/'))
+#     if os.path.exists(format_filename):
+#         if not overwrite:
+#             return format_filename
+#         else:
+#             os.remove(format_filename)
+#     ensure_tree_exists(format_filename)
+#     subprocess.check_call(
+#         [inkscape_path,
+#          '--batch-process',
+#          '--export-area-drawing',
+#          f'--export-type={file_extension}',
+#          f'--export-filename={format_filename}',
+#          svg_filename],
+#         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+#         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+#     )
+#     return format_filename
+
+
+def batch_process(svg_files, export_png=False, export_pdf=False, chunk_size=20):
+    """
+    Convert text to path and export PNG/PDF in one Inkscape launch per chunk.
+    """
+
+    if not svg_files:
+        return
+
+    creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+
+    for group in chunked(svg_files, chunk_size):
+
+        actions = []
+
+        for svg_path in group:
+            abs_svg = os.path.abspath(svg_path)
+            base, _ = os.path.splitext(abs_svg)
+
+            # --- OPEN FILE ---
+            actions.append(f"file-open:{abs_svg}")
+
+            # --- CONVERT TEXT TO PATH ---
+            actions.extend([
+                "select-all",
+                "object-to-path",
+                "export-type=svg",
+                f"export-filename:{abs_svg}",
+                "export-do",
+            ])
+
+            # --- EXPORT PNG ---
+            if export_png:
+                png_path = base.replace(os.sep + "svg" + os.sep,
+                                        os.sep + "png" + os.sep) + ".png"
+                os.makedirs(os.path.dirname(png_path), exist_ok=True)
+
+                actions.extend([
+                    "export-area-drawing",
+                    "export-type=png",
+                    f"export-filename:{png_path}",
+                    "export-do",
+                ])
+
+            # --- EXPORT PDF ---
+            if export_pdf:
+                pdf_path = base.replace(os.sep + "svg" + os.sep,
+                                        os.sep + "pdf" + os.sep) + ".pdf"
+                os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
+
+                actions.extend([
+                    "export-area-drawing",
+                    "export-type=pdf",
+                    f"export-filename:{pdf_path}",
+                    "export-do",
+                ])
+
+            # --- CLOSE FILE (CRITICAL) ---
+            actions.append("file-close")
+
+        cmd = [
+            inkscape_path,
+            "--batch-process",
+            f"--actions={';'.join(actions)}",
+        ]
+
+        subprocess.check_call(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creation_flags
+        )
+
 
 
 def generate_png(name, subtitle, filename=None):
@@ -304,6 +384,9 @@ def main():
     saved_names_meta = []
 
     names = args.input_file.read().splitlines()
+
+    all_svg_files = []
+
     for name in tqdm(names):
         name = name.strip()
         if not name:
@@ -322,21 +405,26 @@ def main():
             filename = f'{filename} ({seen_names[filename]})'
         seen_names[filename] = 0
 
+        svg_path = generate_svg(name, subtitle, filename)
+
         meta.update({
             'name': name,
-            'svg': generate_svg(name, subtitle, filename),
+            'svg': svg_path,
             'pdf': None,
             'png': None,
         })
 
-        if args.pdf:
-            meta['pdf'] = generate_pdf(name, subtitle, filename)
-            # print(meta['pdf'])
-        if args.png:
-            meta['png'] = generate_png(name, subtitle, filename)
-            # print(meta['png'])
+        all_svg_files.append(svg_path)
 
         saved_names_meta.append(meta)
+
+    batch_process(
+        all_svg_files,
+        export_png=args.png,
+        export_pdf=args.pdf,
+        chunk_size=20
+    )
+
 
     json.dump(saved_names_meta, sys.stdout, ensure_ascii=False, indent=2)
 
