@@ -2,3 +2,4 @@
 output/
 participants.xlsx
 template.svg
+/__pycache__
