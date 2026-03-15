@@ -183,9 +183,9 @@ def generate_svg(name, subtitle, filename=None):
         result = replace_text_with_html_support(template, replace_text, name)
         result = replace_text_with_html_support(result, subtitle_replace_text, subtitle)
         # Center the text after replacement
-        # result = center_text_in_svg(result, name)
-        # if subtitle != subtitle_replace_text:
-        #     result = center_text_in_svg(result, subtitle)
+        result = center_text_in_svg(result, name)
+        if subtitle != subtitle_replace_text:
+            result = center_text_in_svg(result, subtitle)
         with open(filename, 'w', encoding='utf-8') as output_file:
             output_file.write(result)
         # Convert text to paths to ensure font independence
