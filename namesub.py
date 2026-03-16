@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
 import argparse
+import base64
 import html
+import io
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 
@@ -226,11 +229,31 @@ def embed_logos_in_svg(svg_content, logo_svg_content):
         vb_w = float(w_m.group(1)) if w_m else 100.0
         vb_h = float(h_m.group(1)) if h_m else 100.0
 
+    # ── Strip Inkscape-specific metadata that can cause rendering issues ─────
+    # Remove <sodipodi:namedview> and <inkscape:page> elements which can cause
+    # Inkscape to render extra pages when processing the final SVG.
+    logo_content = re.sub(
+        r'<sodipodi:namedview[^>]*>.*?</sodipodi:namedview>',
+        '',
+        logo_svg_content,
+        flags=re.DOTALL,
+    )
+    logo_content = re.sub(
+        r'<inkscape:page[^>]*/>',
+        '',
+        logo_content,
+    )
+    # Also remove any other Inkscape/Sodipodi namespace attributes from the root <svg>
+    logo_content = re.sub(
+        r'\s+(?:sodipodi|inkscape):[^=]*="[^"]*"',
+        '',
+        logo_content,
+    )
+
     # ── Rename all IDs to avoid collisions with the template ────────────────
     # Collect IDs in order of appearance; process longest first to avoid
     # accidentally replacing a short ID that appears as a substring of a longer one.
-    ids = list(dict.fromkeys(re.findall(r'\bid=["\']([^"\']+)["\']', logo_svg_content)))
-    logo_content = logo_svg_content
+    ids = list(dict.fromkeys(re.findall(r'\bid=["\']([^"\']+)["\']', logo_content)))
     for oid in sorted(ids, key=len, reverse=True):
         nid = f'{uid}_{oid}'
         logo_content = re.sub(
@@ -248,6 +271,46 @@ def embed_logos_in_svg(svg_content, logo_svg_content):
     # ── Separate <defs> from body ────────────────────────────────────────────
     defs_m = re.search(r'<defs\b[^>]*>(.*?)</defs>', logo_content, re.DOTALL)
     defs_content = defs_m.group(1).strip() if defs_m else ''
+
+    # ── Fix CSS classes that don't have fill defined ──────────────────────────
+    # Some logos (like Astea) have CSS classes without fill, which can inherit
+    # the parent's fill color (e.g., white from the logo box). Add explicit
+    # black fill to classes that don't have one defined anywhere in the stylesheet.
+    if defs_content:
+        # First, collect all class names that DO have fill defined in their own rules
+        classes_with_fill = set()
+        fill_pattern = r'\.([a-zA-Z0-9_-]+)\s*\{[^}]*fill\s*:'
+        for match in re.finditer(fill_pattern, defs_content):
+            classes_with_fill.add(match.group(1))
+        
+        # Now fix rules that don't have fill and contain classes that need it
+        def fix_class_rule(match):
+            full_match = match.group(0)
+            selector = match.group(1)  # e.g., ".cls-1" or ".cls-1, .cls-2, .cls-3"
+            rule_body = match.group(2)  # content between { }
+            
+            # Skip if this rule already has fill
+            if 'fill:' in rule_body or 'fill ' in rule_body:
+                return full_match
+            
+            # Extract individual class names from the selector
+            class_names = re.findall(r'\.([a-zA-Z0-9_-]+)', selector)
+            
+            # Check if at least one class in this selector needs fill
+            # (i.e., doesn't have fill defined in a later rule)
+            needs_fill = any(cls not in classes_with_fill for cls in class_names)
+            
+            if needs_fill:
+                # Add fill: #000 before the closing brace
+                # Preserve indentation from the rule body
+                indent = ' ' * (len(rule_body) - len(rule_body.lstrip())) if rule_body.strip() else '      '
+                return f'{selector} {{\n{rule_body.rstrip()}\n{indent}fill: #000;\n      }}'
+            return full_match
+        
+        # Match CSS rules (handles both single and comma-separated selectors)
+        # Pattern matches: .class or .class1, .class2, .class3 followed by { ... }
+        rule_pattern = r'((?:\.\s*[a-zA-Z0-9_-]+\s*(?:,\s*\.\s*[a-zA-Z0-9_-]+)*))\s*\{([^}]*)\}'
+        defs_content = re.sub(rule_pattern, fix_class_rule, defs_content, flags=re.MULTILINE | re.DOTALL)
 
     # Body: everything between the outer <svg> tags, minus the <defs> block
     body = re.sub(r'<svg\b[^>]*>', '', logo_content)
@@ -331,6 +394,153 @@ def embed_logos_in_svg(svg_content, logo_svg_content):
     return svg_content
 
 
+def get_raster_dimensions(file_path):
+    """Return (width, height) in pixels for a PNG or WebP file.
+
+    Parses the binary header directly so Pillow is not required.
+    Falls back to Pillow if the format is not recognised.
+    """
+    with open(file_path, 'rb') as f:
+        header = f.read(30)
+
+        # ── PNG ───────────────────────────────────────────────────────────────────
+        if header[:8] == b'\x89PNG\r\n\x1a\n':
+            w, h = struct.unpack('>II', header[16:24])
+            return w, h
+
+        # ── WebP ──────────────────────────────────────────────────────────────────
+        if header[:4] == b'RIFF' and header[8:12] == b'WEBP':
+            chunk_type = header[12:16]
+            
+            if chunk_type == b'VP8 ':    # lossy
+                # Read more bytes to get to the frame header
+                f.seek(0)
+                data = f.read(50)
+                if len(data) >= 30:
+                    # VP8 frame header: 3-byte sync code, then dimensions
+                    # Dimensions are at offset 26-29 (after RIFF/WEBP/chunk header)
+                    w = struct.unpack_from('<H', data, 26)[0] & 0x3FFF
+                    h = struct.unpack_from('<H', data, 28)[0] & 0x3FFF
+                    return w, h
+            
+            elif chunk_type == b'VP8L':  # lossless
+                # Read more bytes to get the VP8L chunk data
+                f.seek(0)
+                data = f.read(25)
+                if len(data) >= 25:
+                    # VP8L: after chunk header (12 bytes), first 4 bytes contain dimensions
+                    bits = struct.unpack_from('<I', data, 21)[0]
+                    w = (bits & 0x3FFF) + 1
+                    h = ((bits >> 14) & 0x3FFF) + 1
+                    return w, h
+            
+            elif chunk_type == b'VP8X':  # extended
+                # Read more bytes to get VP8X chunk data
+                f.seek(0)
+                data = f.read(30)
+                if len(data) >= 30:
+                    # VP8X: after chunk header (12 bytes), flags (1 byte), then dimensions
+                    # Width: 3 bytes at offset 24-26 (24-bit little-endian, value is width-1)
+                    # Height: 3 bytes at offset 27-29 (24-bit little-endian, value is height-1)
+                    w = (data[24] | (data[25] << 8) | (data[26] << 16)) + 1
+                    h = (data[27] | (data[28] << 8) | (data[29] << 16)) + 1
+                    return w, h
+
+    # ── Fallback: try Pillow ──────────────────────────────────────────────────
+    try:
+        from PIL import Image
+        with Image.open(file_path) as img:
+            return img.size
+    except (ImportError, Exception):
+        return 100, 100
+
+
+def embed_raster_logos_in_svg(svg_content, logo_path, mime_type):
+    """
+    Embed a raster (PNG/WebP) logo into both white logo boxes as a base64 data URI.
+
+    Uses the same box layout and scaling logic as embed_logos_in_svg:
+      - Rectangle 341 – bottom half, normal orientation
+      - Rectangle 342 – top half,    flipped 180°
+
+    The logo is scaled uniformly to fit inside each box with 10 px padding and
+    centered horizontally and vertically.
+
+    Note: WebP is converted to PNG for better SVG renderer compatibility (many
+    renderers, including Inkscape, don't support WebP data URIs).
+    """
+    _embed_logo_call_count[0] += 1
+    uid = f'lg{_embed_logo_call_count[0]:04d}'
+
+    img_w, img_h = get_raster_dimensions(logo_path)
+
+    # Convert WebP to PNG if Pillow is available (for better SVG renderer support)
+    if mime_type == 'image/webp':
+        try:
+            from PIL import Image
+            import io
+            with Image.open(logo_path) as img:
+                # Convert to RGBA if needed, then to PNG
+                if img.mode != 'RGBA':
+                    img = img.convert('RGBA')
+                png_buffer = io.BytesIO()
+                img.save(png_buffer, format='PNG')
+                logo_bytes = png_buffer.getvalue()
+            mime_type = 'image/png'  # Use PNG data URI instead
+        except (ImportError, Exception):
+            # Fall back to WebP if conversion fails
+            with open(logo_path, 'rb') as f:
+                logo_bytes = f.read()
+    else:
+        with open(logo_path, 'rb') as f:
+            logo_bytes = f.read()
+
+    data_uri = (
+        f'data:{mime_type};base64,'
+        + base64.b64encode(logo_bytes).decode('ascii')
+    )
+
+    padding = 10
+    groups = []
+    for rect_id, (bx, by, bw, bh, flipped) in _LOGO_BOXES.items():
+        avail_w = bw - 2 * padding
+        avail_h = bh - 2 * padding
+        s = min(avail_w / img_w, avail_h / img_h)
+
+        logo_cx = img_w / 2
+        logo_cy = img_h / 2
+        cx = bx + bw / 2
+        cy = by + bh / 2
+
+        if flipped:
+            # 180° flip around the box centre — same maths as the SVG version
+            tx = cx + logo_cx * s
+            ty = cy + logo_cy * s
+            transform = f'translate({tx:.4f},{ty:.4f}) scale({-s:.6f})'
+        else:
+            tx = bx + (bw - img_w * s) / 2
+            ty = by + (bh - img_h * s) / 2
+            transform = f'translate({tx:.4f},{ty:.4f}) scale({s:.6f})'
+
+        safe_id = rect_id.replace(' ', '_')
+        groups.append(
+            f'<g id="logo_{safe_id}_{uid}" transform="{transform}">\n'
+            f'<image x="0" y="0" width="{img_w}" height="{img_h}" '
+            f'href="{data_uri}" preserveAspectRatio="xMidYMid meet"/>\n'
+            f'</g>'
+        )
+
+    logo_markup = '\n'.join(groups)
+    svg_content = re.sub(
+        r'(<rect\s+id="Rectangle 342"[^>]*/>\s*)(</g>)',
+        lambda m: m.group(1) + logo_markup + '\n' + m.group(2),
+        svg_content,
+        flags=re.DOTALL,
+    )
+
+    return svg_content
+
+
 def chunked(iterable, size):
     for i in range(0, len(iterable), size):
         yield iterable[i:i + size]
@@ -351,9 +561,19 @@ def generate_svg(name, subtitle, logo_path=None, filename=None):
         # Embed logo into both white boxes if a logo path was provided
         if logo_path:
             try:
-                with open(logo_path, encoding='utf-8') as lf:
-                    logo_svg = lf.read()
-                result = embed_logos_in_svg(result, logo_svg)
+                ext = os.path.splitext(logo_path)[1].lower()
+                if ext == '.svg':
+                    with open(logo_path, encoding='utf-8') as lf:
+                        logo_svg = lf.read()
+                    result = embed_logos_in_svg(result, logo_svg)
+                elif ext == '.png':
+                    result = embed_raster_logos_in_svg(result, logo_path, 'image/png')
+                elif ext == '.webp':
+                    result = embed_raster_logos_in_svg(result, logo_path, 'image/webp')
+                else:
+                    sys.stderr.write(
+                        f'Warning: unsupported logo format "{ext}" for "{logo_path}"\n'
+                    )
             except (OSError, IOError) as e:
                 sys.stderr.write(f'Warning: could not read logo "{logo_path}": {e}\n')
         with open(filename, 'w', encoding='utf-8') as output_file:
@@ -502,6 +722,12 @@ def main():
                 logo_field + '.svg',
                 os.path.join(original_dir, logo_field + '.svg'),
                 os.path.join(logos_dir, logo_field + '.svg'),
+                logo_field + '.png',
+                os.path.join(original_dir, logo_field + '.png'),
+                os.path.join(logos_dir, logo_field + '.png'),
+                logo_field + '.webp',
+                os.path.join(original_dir, logo_field + '.webp'),
+                os.path.join(logos_dir, logo_field + '.webp'),
             ]
             for candidate in candidates:
                 if os.path.isfile(candidate):
