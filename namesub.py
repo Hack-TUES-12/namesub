@@ -92,16 +92,33 @@ def replace_text_with_html_support(template, old_text, new_text):
     return template
 
 
+def _parse_text_transform_x_offset(attrs):
+    """
+    Parse transform on <text> to compute local x so that global center = center_x.
+    Returns (kind, value): ('none', None) | ('translate', tx) | ('matrix_flip', a).
+    """
+    transform_match = re.search(r'transform\s*=\s*["\']([^"\']+)["\']', attrs, re.IGNORECASE)
+    if not transform_match:
+        return ('none', None)
+    t = transform_match.group(1).strip()
+    trans = re.match(r'translate\s*\(\s*([-\d.]+)\s*[, ]\s*[-\d.]+\s*\)', t)
+    if trans:
+        return ('translate', float(trans.group(1)))
+    mat = re.match(r'matrix\s*\(\s*-1\s+0\s+0\s+-1\s+([-\d.]+)\s+[-\d.]+\s*\)', t)
+    if mat:
+        return ('matrix_flip', float(mat.group(1)))
+    return ('none', None)
+
+
 def center_text_in_svg(svg_content, text_content):
     """
     Center text in SVG by adding text-anchor="middle" and updating x coordinate.
     Finds the text/tspan element containing the text and centers it.
-    Works with text in any format (plain, HTML entity encoded).
+    Accounts for parent <text> transform so global horizontal center is correct.
     """
     # Calculate center x from viewBox or width
     viewbox_match = re.search(r'viewBox=["\']([^"\']+)["\']', svg_content)
     width_match = re.search(r'width=["\']([^"\']+)["\']', svg_content)
-    
     center_x = None
     if viewbox_match:
         parts = viewbox_match.group(1).split()
@@ -113,60 +130,59 @@ def center_text_in_svg(svg_content, text_content):
             center_x = float(width_str) / 2
         except ValueError:
             pass
-    
     if center_x is None:
         center_x = 297.5  # Default for A4 width (595/2)
-    
-    # Try to find tspan containing the text - search for any tspan that might contain our text
-    # We'll match any tspan and check if it contains our text (in any encoding)
-    tspan_pattern = r'(<tspan[^>]*x=["\'])([^"\']+)(["\'][^>]*>)([^<]*)(</tspan>)'
-    
-    def replace_tspan_if_matches(match):
-        tspan_content = match.group(4)
-        # Check if this tspan contains our text (try unescaping to compare)
+
+    # Match each <text ...>...</text> block so we can use the parent's transform for local x
+    text_block_pattern = re.compile(
+        r'<text([^>]*)>(.*?)</text>',
+        re.IGNORECASE | re.DOTALL
+    )
+    tspan_pattern = re.compile(
+        r'(<tspan[^>]*x=["\'])([^"\']+)(["\'][^>]*>)([^<]*)(</tspan>)',
+        re.IGNORECASE
+    )
+
+    def process_text_block(match):
+        attrs = match.group(1)
+        inner = match.group(2)
         try:
-            unescaped_content = html.unescape(tspan_content)
-            if text_content in unescaped_content or text_content in tspan_content:
-                # This is our tspan, update x to center
-                return match.group(1) + str(center_x) + match.group(3) + match.group(4) + match.group(5)
+            unescaped = html.unescape(inner)
+            if text_content not in unescaped and text_content not in inner:
+                return match.group(0)
         except Exception:
-            if text_content in tspan_content:
-                return match.group(1) + str(center_x) + match.group(3) + match.group(4) + match.group(5)
-        # Not our tspan, return unchanged
-        return match.group(0)
-    
-    # Replace tspan x coordinate for matching tspan elements
-    svg_content = re.sub(tspan_pattern, replace_tspan_if_matches, svg_content, flags=re.IGNORECASE | re.DOTALL)
-    
-    # Find parent text element and add text-anchor="middle"
-    # Look for text elements that contain tspan elements we might have modified
-    text_pattern = r'(<text)([^>]*>)(.*?</tspan>.*?)(</text>)'
-    
-    def add_text_anchor(match):
-        text_start = match.group(1)
-        text_attrs = match.group(2)
-        text_content_part = match.group(3)
-        text_end = match.group(4)
-        
-        # Check if this text element contains our text
-        try:
-            unescaped_content = html.unescape(text_content_part)
-            if text_content not in unescaped_content and text_content not in text_content_part:
-                return match.group(0)  # Not our text element, return unchanged
-        except Exception:
-            if text_content not in text_content_part:
-                return match.group(0)  # Not our text element, return unchanged
-        
-        # Check if text-anchor already exists
-        if 'text-anchor' not in text_attrs:
-            # Add text-anchor="middle" before the closing >
-            text_attrs = text_attrs.rstrip('>') + ' text-anchor="middle">'
-        
-        return text_start + text_attrs + text_content_part + text_end
-    
-    svg_content = re.sub(text_pattern, add_text_anchor, svg_content, flags=re.IGNORECASE | re.DOTALL)
-    
-    return svg_content
+            if text_content not in inner:
+                return match.group(0)
+
+        kind, value = _parse_text_transform_x_offset(attrs)
+        if kind == 'none':
+            local_x = center_x
+        elif kind == 'translate':
+            # global_x = tx + local_x => local_x = center_x - tx
+            local_x = center_x - value
+        else:
+            # matrix(-1 0 0 -1 a b): global_x = a - local_x => local_x = a - center_x
+            local_x = value - center_x
+
+        def replace_tspan(m):
+            cnt = m.group(4)
+            try:
+                u = html.unescape(cnt)
+                if text_content not in u and text_content not in cnt:
+                    return m.group(0)
+            except Exception:
+                if text_content not in cnt:
+                    return m.group(0)
+            return m.group(1) + str(local_x) + m.group(3) + m.group(4) + m.group(5)
+
+        inner = tspan_pattern.sub(replace_tspan, inner)
+        if 'text-anchor' not in (attrs or ''):
+            attrs = attrs.rstrip('>') + ' text-anchor="middle">'
+        # attrs may already end with '>' when we added text-anchor; avoid double >
+        close_angle = '' if attrs.rstrip().endswith('>') else '>'
+        return '<text' + attrs + close_angle + inner + '</text>'
+
+    return text_block_pattern.sub(process_text_block, svg_content)
 
 def chunked(iterable, size):
     for i in range(0, len(iterable), size):
